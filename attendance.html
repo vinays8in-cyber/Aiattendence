@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Attendance</title>
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+<style>
+  :root { --bg:#fff; --fg:#111; --card:#f3f3f5; --accent:#2563eb; color-scheme: light dark; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eee; --card:#1e1e22; --accent:#3b82f6; } }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui,sans-serif; background:var(--bg); color:var(--fg); padding:12px; max-width:640px; margin:auto; }
+  h1 { font-size:20px; margin:4px 0 10px; }
+  .cam { position:relative; width:100%; background:#000; border-radius:12px; overflow:hidden; }
+  video, canvas { width:100%; display:block; }
+  canvas { position:absolute; top:0; left:0; height:100%; }
+  .row { display:flex; gap:8px; margin:10px 0; flex-wrap:wrap; }
+  button, input { font-size:16px; padding:10px 14px; border-radius:10px; border:1px solid #8885; background:var(--card); color:var(--fg); }
+  button { background:var(--accent); color:#fff; border:none; }
+  button.alt { background:var(--card); color:var(--fg); border:1px solid #8885; }
+  input { flex:1; min-width:140px; }
+  #status { font-size:14px; opacity:.8; margin:6px 0; }
+  .card { background:var(--card); border-radius:10px; padding:10px; margin-top:10px; }
+  li { margin:4px 0; }
+</style>
+</head>
+<body>
+<h1>AI Attendance</h1>
+<div class="cam"><video id="v" autoplay muted playsinline></video><canvas id="c"></canvas></div>
+<div id="status">Loading models...</div>
+
+<div class="card">
+  <b>1. Register face</b>
+  <div class="row">
+    <input id="name" placeholder="Student name">
+    <button id="reg">Capture &amp; Save</button>
+  </div>
+  <div id="people" style="font-size:14px"></div>
+</div>
+
+<div class="card">
+  <b>2. Take attendance</b>
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="stop" class="alt">Stop</button>
+    <button id="csv" class="alt">Download CSV</button>
+    <button id="clear" class="alt">Reset all</button>
+  </div>
+  <ul id="log"></ul>
+</div>
+
+<script>
+const MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+const video = document.getElementById('v'), canvas = document.getElementById('c');
+const statusEl = document.getElementById('status');
+const opts = new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 });
+let people = JSON.parse(localStorage.getItem('people') || '{}');   // name -> [descriptor]
+let records = JSON.parse(localStorage.getItem('att') || '[]');     // {name,date,time}
+let timer = null;
+
+const today = () => new Date().toISOString().slice(0, 10);
+const save = () => { localStorage.setItem('people', JSON.stringify(people)); localStorage.setItem('att', JSON.stringify(records)); };
+
+function render() {
+  document.getElementById('people').textContent = Object.keys(people).length ? 'Registered: ' + Object.keys(people).join(', ') : 'No faces registered yet';
+  const log = document.getElementById('log');
+  log.innerHTML = '';
+  records.filter(r => r.date === today()).forEach(r => { const li = document.createElement('li'); li.textContent = `${r.name} - ${r.time}`; log.appendChild(li); });
+}
+
+async function init() {
+  try {
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(MODELS),
+      faceapi.nets.faceLandmark68Net.loadFromUri(MODELS),
+      faceapi.nets.faceRecognitionNet.loadFromUri(MODELS)
+    ]);
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+    statusEl.textContent = 'Ready. Register faces, then press Start.';
+  } catch (e) {
+    statusEl.textContent = 'Error: ' + e.message + ' (camera needs HTTPS and permission)';
+  }
+  render();
+}
+
+document.getElementById('reg').onclick = async () => {
+  const name = document.getElementById('name').value.trim();
+  if (!name) return alert('Enter a name first');
+  const d = await faceapi.detectSingleFace(video, opts).withFaceLandmarks().withFaceDescriptor();
+  if (!d) return alert('No face found. Face the camera in good light.');
+  (people[name] = people[name] || []).push(Array.from(d.descriptor));
+  save(); render();
+  statusEl.textContent = `Saved ${name} (${people[name].length} photo). Tap again to add more angles.`;
+};
+
+document.getElementById('start').onclick = () => {
+  const names = Object.keys(people);
+  if (!names.length) return alert('Register at least one face');
+  const labeled = names.map(n => new faceapi.LabeledFaceDescriptors(n, people[n].map(a => new Float32Array(a))));
+  const matcher = new faceapi.FaceMatcher(labeled, 0.5);
+  clearInterval(timer);
+  statusEl.textContent = 'Scanning...';
+  timer = setInterval(async () => {
+    if (!video.videoWidth) return;
+    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const found = await faceapi.detectAllFaces(video, opts).withFaceLandmarks().withFaceDescriptors();
+    found.forEach(f => {
+      const m = matcher.findBestMatch(f.descriptor);
+      const b = f.detection.box, ok = m.label !== 'unknown';
+      ctx.strokeStyle = ok ? '#22c55e' : '#ef4444'; ctx.lineWidth = 3; ctx.strokeRect(b.x, b.y, b.width, b.height);
+      ctx.fillStyle = ctx.strokeStyle; ctx.font = '20px sans-serif'; ctx.fillText(ok ? m.label : 'Unknown', b.x, Math.max(20, b.y - 6));
+      if (ok && !records.some(r => r.name === m.label && r.date === today())) {
+        records.push({ name: m.label, date: today(), time: new Date().toLocaleTimeString() });
+        save(); render();
+      }
+    });
+  }, 700);
+};
+
+document.getElementById('stop').onclick = () => { clearInterval(timer); canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); statusEl.textContent = 'Stopped.'; };
+
+document.getElementById('csv').onclick = () => {
+  const rows = [['Name', 'Date', 'Time'], ...records.map(r => [r.name, r.date, r.time])];
+  const blob = new Blob([rows.map(r => r.join(',')).join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'attendance.csv'; a.click();
+};
+
+document.getElementById('clear').onclick = () => {
+  if (confirm('Delete all registered faces and attendance?')) { people = {}; records = []; save(); render(); }
+};
+
+init();
+</script>
+</body>
+</html>
